@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional, Tuple
 
+import ctypes
 import json
 import win32api
 import win32con
@@ -15,6 +16,12 @@ import win32gui
 
 from .client_window import WindowInfo
 from pathlib import Path
+
+# Pane size limits
+MIN_PANE_W = 50
+MAX_PANE_W = 300
+MIN_PANE_H = 50
+MAX_PANE_H = 500
 
 
 @dataclass
@@ -45,11 +52,24 @@ class TransparentOverlay:
     on_save_custom: Optional[Callable[[], None]] = None
     on_close_custom: Optional[Callable[[], None]] = None
     custom_modal_visible: bool = False
+    options_btn_rect: Optional[Tuple[int, int, int, int]] = None
+    on_options_click: Optional[Callable[[], None]] = None
+    on_apply_options: Optional[Callable[[Optional[int], dict], None]] = None
+    on_panes_changed: Optional[Callable[[dict], None]] = None
+    options_modal_visible: bool = False
     _colorkey = win32api.RGB(255, 0, 255)
     custom_actions_rect: Optional[Tuple[int, int, int, int]] = None
     custom_rows: List[dict] = field(default_factory=list)
     _custom_active_field: Optional[Tuple[str, int]] = None  # ("name"/"count", idx)
     _custom_capture_action: Optional[Tuple[str, int]] = None  # ("action1"/"action2", idx)
+    options_rect: Optional[Tuple[int, int, int, int]] = None
+    available_windows: List[WindowInfo] = field(default_factory=list)
+    selected_window_hwnd: Optional[int] = None
+    _pane_sizes_backup: dict = field(default_factory=dict)
+    _selected_window_backup: Optional[int] = None
+    _relative_positions: dict = field(default_factory=dict)
+    _was_iconic: bool = False
+    _hidden_due_iconic: bool = False
 
     # draggable panes
     status_pane: Tuple[int, int, int, int] = (10, 100, 240, 140)  # x,y,w,h
@@ -65,8 +85,12 @@ class TransparentOverlay:
         font_id = getattr(win32con, "DEFAULT_GUI_FONT", getattr(win32con, "SYSTEM_FONT", 17))
         self._font = win32gui.GetStockObject(font_id)
         self._load_positions()
+        self._clamp_panes_to_window()
         self._ensure_custom_rect()
+        self._ensure_options_rect()
         self._load_custom_actions()
+        self._pane_sizes_backup = self._pane_sizes_snapshot()
+        self._selected_window_backup = None
 
     def show(self) -> None:
         self._register_class()
@@ -112,28 +136,29 @@ class TransparentOverlay:
         self._hwnd = hwnd
         win32gui.SetLayeredWindowAttributes(hwnd, self._colorkey, 255, win32con.LWA_COLORKEY)
         win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, left, top, width, height, win32con.SWP_SHOWWINDOW)
+        ctypes.windll.user32.SetTimer(hwnd, 1, 500, None)
+        # periodic sync timer (ms)
 
     def _wnd_proc(self, hwnd: int, msg: int, wparam: int, lparam: int):
         if msg == win32con.WM_NCHITTEST:
-            x = win32api.LOWORD(lparam)
-            y = win32api.HIWORD(lparam)
-            if self._hit_titlebar(x, y) or self._hit_custom_modal(x, y):
+            sx = win32api.LOWORD(lparam)
+            sy = win32api.HIWORD(lparam)
+            cx = sx - self.window.rect[0]
+            cy = sy - self.window.rect[1]
+            # Modale mają priorytet nad panelami
+            if self._hit_custom_modal(cx, cy) or self._hit_options_modal(cx, cy):
                 return win32con.HTCLIENT
-            if self._hit_button(x, y) or self._hit_custom_btn(x, y):
+            if self._hit_button(cx, cy) or self._hit_custom_btn(cx, cy) or self._hit_options_btn(cx, cy):
+                return win32con.HTCLIENT
+            if self._hit_titlebar(cx, cy):
                 return win32con.HTCLIENT
             return win32con.HTTRANSPARENT
         if msg == win32con.WM_LBUTTONDOWN:
-            x = win32api.LOWORD(lparam) + self.window.rect[0]
-            y = win32api.HIWORD(lparam) + self.window.rect[1]
-            pane = self._which_titlebar(x, y)
-            if pane:
-                if pane == "status":
-                    px, py, w, h = self.status_pane
-                elif pane == "actions":
-                    px, py, w, h = self.actions_pane
-                else:
-                    px, py, w, h = self.controls_pane
-                self._dragging = (pane, x - px - self.window.rect[0], y - py - self.window.rect[1])
+            x = win32api.LOWORD(lparam)
+            y = win32api.HIWORD(lparam)
+            if self.custom_modal_visible and self._handle_custom_click(lparam):
+                return 0
+            if self.options_modal_visible and self._handle_options_click(lparam):
                 return 0
             if self._hit_button(x, y):
                 if self.on_button_click:
@@ -143,31 +168,52 @@ class TransparentOverlay:
                 if self.on_custom_click:
                     self.on_custom_click()
                 return 0
-            if self.custom_modal_visible and self._handle_custom_click(lparam):
+            if self._hit_options_btn(x, y):
+                if self.on_options_click:
+                    self.on_options_click()
                 return 0
+            pane = self._which_titlebar(x, y)
+            if pane:
+                if pane == "status":
+                    px, py, w, h = self.status_pane
+                elif pane == "actions":
+                    px, py, w, h = self.actions_pane
+                else:
+                    px, py, w, h = self.controls_pane
+                self._dragging = (pane, x - px, y - py)
+                return 0
+        if msg == win32con.WM_WINDOWPOSCHANGED or msg == win32con.WM_MOVE or msg == win32con.WM_SIZE:
+            self._sync_to_window()
         if msg == win32con.WM_LBUTTONUP:
             if self._dragging:
                 self._save_positions()
             self._dragging = None
         if msg == win32con.WM_MOUSEMOVE and self._dragging:
             pane, dx, dy = self._dragging
-            x = win32api.LOWORD(lparam) + self.window.rect[0]
-            y = win32api.HIWORD(lparam) + self.window.rect[1]
+            x = win32api.LOWORD(lparam)
+            y = win32api.HIWORD(lparam)
             if pane == "status":
                 _, _, w, h = self.status_pane
-                self.status_pane = (x - dx - self.window.rect[0], y - dy - self.window.rect[1], w, h)
+                self.status_pane = (x - dx, y - dy, w, h)
             elif pane == "actions":
                 _, _, w, h = self.actions_pane
-                self.actions_pane = (x - dx - self.window.rect[0], y - dy - self.window.rect[1], w, h)
+                self.actions_pane = (x - dx, y - dy, w, h)
             elif pane == "controls":
                 _, _, w, h = self.controls_pane
-                self.controls_pane = (x - dx - self.window.rect[0], y - dy - self.window.rect[1], w, h)
+                self.controls_pane = (x - dx, y - dy, w, h)
             win32gui.InvalidateRect(hwnd, None, True)
             return 0
         if msg == win32con.WM_PAINT:
             self._on_paint(hwnd)
             return 0
+        if msg == win32con.WM_TIMER:
+            self._sync_to_window()
+            return 0
         if msg == win32con.WM_DESTROY:
+            try:
+                ctypes.windll.user32.KillTimer(hwnd, 1)
+            except Exception:
+                pass
             if self.on_close_custom:
                 self.on_close_custom()
             return 0
@@ -184,6 +230,8 @@ class TransparentOverlay:
                 self._draw_panel_outline(hdc, panel)
             self._draw_panes(hdc)
             self._draw_custom_modal(hdc)
+            self._draw_options_modal(hdc)
+            self._draw_active_indicator(hdc)
         finally:
             win32gui.EndPaint(hwnd, paint_struct)
 
@@ -212,6 +260,12 @@ class TransparentOverlay:
         if self._hwnd:
             win32gui.InvalidateRect(self._hwnd, self._pane_rect_abs(self.controls_pane), True)
 
+    def set_options_button(self, rect: Tuple[int, int, int, int], on_click: Callable[[], None]) -> None:
+        self.options_btn_rect = rect
+        self.on_options_click = on_click
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, self._pane_rect_abs(self.controls_pane), True)
+
     # Drawing helpers
     def _draw_panel_outline(self, hdc: int, panel: Panel) -> None:
         left, top, right, bottom = panel.rect()
@@ -232,8 +286,7 @@ class TransparentOverlay:
 
     def _draw_pane(self, hdc: int, pane: Tuple[int, int, int, int], lines: List[str], include_buttons: bool) -> None:
         x, y, w, h = pane
-        left, top = self.window.rect[0], self.window.rect[1]
-        px, py = x + left, y + top
+        px, py = x, y
         title_h = 20
         # border
         # title bar only (no border/background)
@@ -262,14 +315,17 @@ class TransparentOverlay:
             win32gui.SetBkMode(hdc, old_bk)
 
         if include_buttons:
-            pane_offset_x = x + left
-            pane_offset_y = y + top
+            pane_offset_x = x
+            pane_offset_y = y
             if self.button_rect:
                 bx, by, bw, bh = self.button_rect
                 self._draw_button_rect(hdc, pane_offset_x + bx, pane_offset_y + by, bw, bh, self.button_label)
             if self.custom_btn_rect:
                 cx, cy, cw, ch = self.custom_btn_rect
                 self._draw_button_rect(hdc, pane_offset_x + cx, pane_offset_y + cy, cw, ch, "Custom")
+            if self.options_btn_rect:
+                ox, oy, ow, oh = self.options_btn_rect
+                self._draw_button_rect(hdc, pane_offset_x + ox, pane_offset_y + oy, ow, oh, "Options")
 
     def _draw_button_rect(self, hdc: int, x: int, y: int, w: int, h: int, label: str) -> None:
         brush = win32gui.CreateSolidBrush(win32api.RGB(60, 60, 60))
@@ -310,8 +366,7 @@ class TransparentOverlay:
         if not self.custom_modal_visible or not self.custom_actions_rect:
             return
         x, y, w, h = self.custom_actions_rect
-        left, top = self.window.rect[0], self.window.rect[1]
-        px, py = x + left, y + top
+        px, py = x, y
         title_h = 24
         brush = win32gui.CreateSolidBrush(win32api.RGB(30, 30, 30))
         pen = win32gui.CreatePen(win32con.PS_SOLID, 1, win32api.RGB(160, 160, 160))
@@ -366,15 +421,141 @@ class TransparentOverlay:
             win32gui.DeleteObject(brush)
             win32gui.DeleteObject(pen)
 
+    def _draw_options_modal(self, hdc: int) -> None:
+        if not self.options_modal_visible or not self.options_rect:
+            return
+        x, y, w, h = self.options_rect
+        px, py = x, y
+        title_h = 24
+        brush = win32gui.CreateSolidBrush(win32api.RGB(30, 30, 30))
+        pen = win32gui.CreatePen(win32con.PS_SOLID, 1, win32api.RGB(160, 160, 160))
+        old_brush = win32gui.SelectObject(hdc, brush)
+        old_pen = win32gui.SelectObject(hdc, pen)
+        old_bk = win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+        old_color = win32gui.SetTextColor(hdc, win32api.RGB(230, 230, 230))
+        try:
+            win32gui.Rectangle(hdc, px, py, px + w, py + h)
+            bar_brush = win32gui.CreateSolidBrush(win32api.RGB(50, 50, 50))
+            win32gui.FillRect(hdc, (px, py, px + w, py + title_h), bar_brush)
+            win32gui.DeleteObject(bar_brush)
+            win32gui.DrawText(
+                hdc,
+                "Options",
+                -1,
+                (px + 6, py + 2, px + w - 6, py + title_h),
+                win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+            )
+            content_x = px + 8
+            content_y = py + title_h + 8
+            # Windows list
+            win32gui.DrawText(
+                hdc,
+                "Game window (ironcore.exe):",
+                -1,
+                (content_x, content_y, px + w - 16, content_y + 18),
+                win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+            )
+            list_y = content_y + 18
+            row_h = 24
+            if not self.available_windows:
+                win32gui.DrawText(
+                    hdc,
+                    "Brak dostepnych okien procesu.",
+                    -1,
+                    (content_x, list_y, px + w - 16, list_y + row_h),
+                    win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+                )
+                list_height = row_h
+            else:
+                for idx, winfo in enumerate(self.available_windows):
+                    ry = list_y + idx * row_h
+                    label = f"{winfo.hwnd} | pid {winfo.process_id} | {winfo.width}x{winfo.height}"
+                    prefix = "[x] " if self.selected_window_hwnd == winfo.hwnd else "[ ] "
+                    self._draw_button_rect(hdc, content_x, ry, min(360, w - 16), row_h - 2, prefix + label)
+                list_height = max(row_h, len(self.available_windows) * row_h)
+
+            panes_y = list_y + list_height + 10
+            win32gui.DrawText(
+                hdc,
+                "Pane sizes (w/h):",
+                -1,
+                (content_x, panes_y, px + w - 16, panes_y + 18),
+                win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+            )
+            row_y = panes_y + 20
+            pane_rows = [
+                ("status", "Status", self.status_pane),
+                ("actions", "Actions", self.actions_pane),
+                ("controls", "Controls", self.controls_pane),
+            ]
+            for idx, (name, label, pane) in enumerate(pane_rows):
+                py_row = row_y + idx * 28
+                win32gui.DrawText(
+                    hdc,
+                    label,
+                    -1,
+                    (content_x, py_row, content_x + 60, py_row + 22),
+                    win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+                )
+                w_val = str(pane[2])
+                h_val = str(pane[3])
+                # width controls
+                self._draw_button_rect(hdc, content_x + 70, py_row, 20, 22, "-")
+                self._draw_input(hdc, content_x + 92, py_row, 46, 22, w_val, active=False)
+                self._draw_button_rect(hdc, content_x + 140, py_row, 20, 22, "+")
+                # height controls
+                self._draw_button_rect(hdc, content_x + 180, py_row, 20, 22, "-")
+                self._draw_input(hdc, content_x + 202, py_row, 46, 22, h_val, active=False)
+                self._draw_button_rect(hdc, content_x + 250, py_row, 20, 22, "+")
+
+            apply_y = row_y + len(pane_rows) * 28 + 10
+            self._draw_button_rect(hdc, px + w - 80, apply_y, 70, 26, "Apply")
+            self._draw_button_rect(hdc, px + w - 160, apply_y, 70, 26, "Cancel")
+        finally:
+            win32gui.SelectObject(hdc, old_brush)
+            win32gui.SelectObject(hdc, old_pen)
+            win32gui.SetBkMode(hdc, old_bk)
+            win32gui.SetTextColor(hdc, old_color)
+            win32gui.DeleteObject(brush)
+            win32gui.DeleteObject(pen)
+
+    def _draw_active_indicator(self, hdc: int) -> None:
+        if not self.options_modal_visible:
+            return
+        badge_w, badge_h = 70, 22
+        x = 8
+        y = 8
+        brush = win32gui.CreateSolidBrush(win32api.RGB(20, 120, 20))
+        pen = win32gui.CreatePen(win32con.PS_SOLID, 1, win32api.RGB(200, 255, 200))
+        old_brush = win32gui.SelectObject(hdc, brush)
+        old_pen = win32gui.SelectObject(hdc, pen)
+        old_bk = win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+        old_color = win32gui.SetTextColor(hdc, win32api.RGB(230, 255, 230))
+        try:
+            win32gui.Rectangle(hdc, x, y, x + badge_w, y + badge_h)
+            win32gui.DrawText(
+                hdc,
+                "Active",
+                -1,
+                (x, y, x + badge_w, y + badge_h),
+                win32con.DT_CENTER | win32con.DT_VCENTER | win32con.DT_SINGLELINE,
+            )
+        finally:
+            win32gui.SelectObject(hdc, old_brush)
+            win32gui.SelectObject(hdc, old_pen)
+            win32gui.SetBkMode(hdc, old_bk)
+            win32gui.SetTextColor(hdc, old_color)
+            win32gui.DeleteObject(brush)
+            win32gui.DeleteObject(pen)
+
     # Hit testing helpers
     def _hit_titlebar(self, sx: int, sy: int) -> bool:
         return self._which_titlebar(sx, sy) is not None
 
     def _which_titlebar(self, sx: int, sy: int) -> Optional[str]:
-        left, top = self.window.rect[0], self.window.rect[1]
         for name, pane in (("status", self.status_pane), ("actions", self.actions_pane), ("controls", self.controls_pane)):
             x, y, w, h = pane
-            px, py = x + left, y + top
+            px, py = x, y
             title_h = 20
             if px <= sx <= px + w and py <= sy <= py + title_h:
                 return name
@@ -383,39 +564,47 @@ class TransparentOverlay:
     def _hit_button(self, sx: int, sy: int) -> bool:
         if not self.button_rect:
             return False
-        left, top = self.window.rect[0], self.window.rect[1]
-        px, py = self.controls_pane[0] + left, self.controls_pane[1] + top
+        px, py = self.controls_pane[0], self.controls_pane[1]
         x, y, w, h = self.button_rect
         return px + x <= sx <= px + x + w and py + y <= sy <= py + y + h
 
     def _hit_custom_btn(self, sx: int, sy: int) -> bool:
         if not self.custom_btn_rect:
             return False
-        left, top = self.window.rect[0], self.window.rect[1]
-        px, py = self.controls_pane[0] + left, self.controls_pane[1] + top
+        px, py = self.controls_pane[0], self.controls_pane[1]
         x, y, w, h = self.custom_btn_rect
+        return px + x <= sx <= px + x + w and py + y <= sy <= py + y + h
+
+    def _hit_options_btn(self, sx: int, sy: int) -> bool:
+        if not self.options_btn_rect:
+            return False
+        px, py = self.controls_pane[0], self.controls_pane[1]
+        x, y, w, h = self.options_btn_rect
         return px + x <= sx <= px + x + w and py + y <= sy <= py + y + h
 
     def _hit_custom_modal(self, sx: int, sy: int) -> bool:
         if not self.custom_modal_visible or not self.custom_actions_rect:
             return False
-        left, top = self.window.rect[0], self.window.rect[1]
         x, y, w, h = self.custom_actions_rect
-        return left + x <= sx <= left + x + w and top + y <= sy <= top + y + h
+        return x <= sx <= x + w and y <= sy <= y + h
+
+    def _hit_options_modal(self, sx: int, sy: int) -> bool:
+        if not self.options_modal_visible or not self.options_rect:
+            return False
+        x, y, w, h = self.options_rect
+        return x <= sx <= x + w and y <= sy <= y + h
 
     def _pane_rect_abs(self, pane: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
         x, y, w, h = pane
-        left, top = self.window.rect[0], self.window.rect[1]
-        return (left + x, top + y, left + x + w, top + y + h)
+        return (x, y, x + w, y + h)
 
     def _handle_custom_click(self, lparam: int) -> bool:
         if not self.custom_modal_visible or not self.custom_actions_rect:
             return False
-        left, top = self.window.rect[0], self.window.rect[1]
-        sx = win32api.LOWORD(lparam) + left
-        sy = win32api.HIWORD(lparam) + top
+        sx = win32api.LOWORD(lparam)
+        sy = win32api.HIWORD(lparam)
         x, y, w, h = self.custom_actions_rect
-        px, py = x + left, y + top
+        px, py = x, y
         title_h = 24
         content_x = px + 8
         content_y = py + title_h + 8
@@ -424,6 +613,8 @@ class TransparentOverlay:
         if self._point_in_rect(sx, sy, (px + w - 70, py + h - 32, 60, 24)):
             self._save_custom_actions()
             self.custom_modal_visible = False
+            if self._hwnd:
+                win32gui.InvalidateRect(self._hwnd, None, True)
             return True
         # plus
         plus_rect = (content_x, content_y + len(self.custom_rows) * row_h, 24, row_h - 4)
@@ -472,10 +663,189 @@ class TransparentOverlay:
                 return True
         return False
 
+    def _handle_options_click(self, lparam: int) -> bool:
+        if not self.options_modal_visible or not self.options_rect:
+            return False
+        sx = win32api.LOWORD(lparam)
+        sy = win32api.HIWORD(lparam)
+        x, y, w, h = self.options_rect
+        px, py = x, y
+        title_h = 24
+        content_x = px + 8
+        content_y = py + title_h + 8
+        list_y = content_y + 18
+        row_h = 24
+
+        # window select
+        for idx, winfo in enumerate(self.available_windows):
+            ry = list_y + idx * row_h
+            rect = (content_x, ry, min(360, w - 16), row_h - 2)
+            if self._point_in_rect(sx, sy, rect):
+                self.selected_window_hwnd = winfo.hwnd
+                if self._hwnd:
+                    win32gui.InvalidateRect(self._hwnd, None, True)
+                return True
+
+        list_height = max(row_h, len(self.available_windows) * row_h if self.available_windows else row_h)
+        panes_y = list_y + list_height + 10
+        row_y = panes_y + 20
+        pane_rows = [
+            ("status", self.status_pane),
+            ("actions", self.actions_pane),
+            ("controls", self.controls_pane),
+        ]
+        for idx, (name, pane) in enumerate(pane_rows):
+            py_row = row_y + idx * 28
+            width_minus = (content_x + 70, py_row, 20, 22)
+            width_plus = (content_x + 140, py_row, 20, 22)
+            height_minus = (content_x + 180, py_row, 20, 22)
+            height_plus = (content_x + 250, py_row, 20, 22)
+            if self._point_in_rect(sx, sy, width_minus):
+                self._change_pane_size(name, dw=-1, dh=0)
+                return True
+            if self._point_in_rect(sx, sy, width_plus):
+                self._change_pane_size(name, dw=1, dh=0)
+                return True
+            if self._point_in_rect(sx, sy, height_minus):
+                self._change_pane_size(name, dw=0, dh=-1)
+                return True
+            if self._point_in_rect(sx, sy, height_plus):
+                self._change_pane_size(name, dw=0, dh=1)
+                return True
+
+        apply_y = row_y + len(pane_rows) * 28 + 10
+        apply_rect = (px + w - 80, apply_y, 70, 26)
+        cancel_rect = (px + w - 160, apply_y, 70, 26)
+        if self._point_in_rect(sx, sy, apply_rect):
+            pane_sizes = self._pane_sizes_snapshot()
+            self.options_modal_visible = False
+            if self.on_apply_options:
+                self.on_apply_options(self.selected_window_hwnd, pane_sizes)
+            if self._hwnd:
+                win32gui.InvalidateRect(self._hwnd, None, True)
+            return True
+        if self._point_in_rect(sx, sy, cancel_rect):
+            self._restore_options_backup()
+            self.options_modal_visible = False
+            if self._hwnd:
+                win32gui.InvalidateRect(self._hwnd, None, True)
+            return True
+
+        return False
+
     # Helpers
     def _point_in_rect(self, px: int, py: int, rect: Tuple[int, int, int, int]) -> bool:
         x, y, w, h = rect
         return x <= px <= x + w and y <= py <= y + h
+
+    def _pane_sizes_snapshot(self) -> dict:
+        return {
+            "status": (self.status_pane[2], self.status_pane[3]),
+            "actions": (self.actions_pane[2], self.actions_pane[3]),
+            "controls": (self.controls_pane[2], self.controls_pane[3]),
+        }
+
+    def _change_pane_size(self, pane_name: str, dw: int, dh: int) -> None:
+        if pane_name == "status":
+            x, y, w, h = self.status_pane
+            self.status_pane = self._clamp_pane((x, y, w + dw, h + dh))
+        elif pane_name == "actions":
+            x, y, w, h = self.actions_pane
+            self.actions_pane = self._clamp_pane((x, y, w + dw, h + dh))
+        elif pane_name == "controls":
+            x, y, w, h = self.controls_pane
+            self.controls_pane = self._clamp_pane((x, y, w + dw, h + dh))
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+        if self.on_panes_changed:
+            self.on_panes_changed(self._pane_sizes_snapshot())
+
+    def _clamp_pane(self, pane: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        x, y, w, h = pane
+        w = min(MAX_PANE_W, max(MIN_PANE_W, w))
+        h = min(MAX_PANE_H, max(MIN_PANE_H, h))
+        max_x = max(0, self.window.width - w)
+        max_y = max(0, self.window.height - h)
+        x = max(0, min(x, max_x))
+        y = max(0, min(y, max_y))
+        return (x, y, w, h)
+
+    def _clamp_panes_to_window(self, invalidate: bool = True) -> None:
+        self.status_pane = self._clamp_pane(self.status_pane)
+        self.actions_pane = self._clamp_pane(self.actions_pane)
+        self.controls_pane = self._clamp_pane(self.controls_pane)
+        if invalidate and self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+        self._capture_relative_positions()
+        if self.on_panes_changed:
+            self.on_panes_changed(self._pane_sizes_snapshot())
+
+    def _sync_to_window(self) -> None:
+        """
+        Keep overlay aligned to the game window (position + size).
+        """
+        try:
+            rect = win32gui.GetWindowRect(self.window.hwnd)
+        except Exception:
+            return
+        if win32gui.IsIconic(self.window.hwnd):
+            self._was_iconic = True
+            if self._hwnd and not self._hidden_due_iconic:
+                win32gui.ShowWindow(self._hwnd, win32con.SW_HIDE)
+                self._hidden_due_iconic = True
+            return
+
+        left, top, right, bottom = rect
+        width, height = right - left, bottom - top
+        if width <= 0 or height <= 0:
+            return
+
+        rect_changed = rect != self.window.rect
+        self.window = WindowInfo(hwnd=self.window.hwnd, process_id=self.window.process_id, rect=rect)
+
+        if rect_changed or self._was_iconic or self._hidden_due_iconic:
+            if self._hwnd:
+                if self._hidden_due_iconic:
+                    win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWNOACTIVATE)
+                    self._hidden_due_iconic = False
+                win32gui.SetWindowPos(
+                    self._hwnd,
+                    win32con.HWND_TOPMOST,
+                    left,
+                    top,
+                    width,
+                    height,
+                    win32con.SWP_SHOWWINDOW,
+                )
+            self._apply_relative_positions()
+            self._ensure_custom_rect()
+            self._ensure_options_rect()
+            self._clamp_panes_to_window(invalidate=False)
+            if self._hwnd:
+                win32gui.InvalidateRect(self._hwnd, None, True)
+        self._was_iconic = False
+
+    def _restore_options_backup(self) -> None:
+        if self._pane_sizes_backup:
+            for name, size in self._pane_sizes_backup.items():
+                if not isinstance(size, (tuple, list)) or len(size) != 2:
+                    continue
+                w, h = size
+                if name == "status":
+                    x, y, _, _ = self.status_pane
+                    self.status_pane = self._clamp_pane((x, y, int(w), int(h)))
+                elif name == "actions":
+                    x, y, _, _ = self.actions_pane
+                    self.actions_pane = self._clamp_pane((x, y, int(w), int(h)))
+                elif name == "controls":
+                    x, y, _, _ = self.controls_pane
+                    self.controls_pane = self._clamp_pane((x, y, int(w), int(h)))
+            self._clamp_panes_to_window()
+        if self._selected_window_backup is not None:
+            self.selected_window_hwnd = self._selected_window_backup
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+        self._capture_relative_positions()
 
     # Positions persistence
     def _load_positions(self) -> None:
@@ -485,21 +855,19 @@ class TransparentOverlay:
                 sp = data.get("status")
                 ap = data.get("actions")
                 cp = data.get("controls")
+                self._relative_positions = {}
                 if sp and len(sp) == 4:
-                    self.status_pane = tuple(sp)  # type: ignore
+                    self.status_pane = self._pane_from_saved(sp, "status")
                 if ap and len(ap) == 4:
-                    self.actions_pane = tuple(ap)  # type: ignore
+                    self.actions_pane = self._pane_from_saved(ap, "actions")
                 if cp and len(cp) == 4:
-                    self.controls_pane = tuple(cp)  # type: ignore
+                    self.controls_pane = self._pane_from_saved(cp, "controls")
             except Exception:
-                pass
+                self._relative_positions = {}
 
     def _save_positions(self) -> None:
-        data = {
-            "status": list(self.status_pane),
-            "actions": list(self.actions_pane),
-            "controls": list(self.controls_pane),
-        }
+        self._capture_relative_positions()
+        data = {k: v for k, v in self._relative_positions.items()}
         try:
             self._positions_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -541,3 +909,117 @@ class TransparentOverlay:
         x = max(0, min(x, self.window.width - w))
         y = max(0, min(y, self.window.height - h))
         self.custom_actions_rect = (x, y, w, h)
+
+    def _ensure_options_rect(self) -> None:
+        if self.options_rect is None:
+            w, h = 520, 240
+            x = (self.window.width - w) // 2
+            y = (self.window.height - h) // 2
+            self.options_rect = (x, y, w, h)
+            return
+        x, y, w, h = self.options_rect
+        max_w = min(self.window.width, 640)
+        max_h = min(self.window.height, 420)
+        w = min(max_w, max(300, w))
+        h = min(max_h, max(180, h))
+        x = max(0, min(x, self.window.width - w))
+        y = max(0, min(y, self.window.height - h))
+        self.options_rect = (x, y, w, h)
+
+    def _pane_from_saved(self, saved: list, name: str) -> tuple[int, int, int, int]:
+        # If values look like relative (<=1), scale to current window
+        try:
+            if all(isinstance(v, (int, float)) and v <= 1.0 for v in saved):
+                rel = tuple(float(v) for v in saved)
+                self._relative_positions[name] = rel
+                return self._pane_from_relative(rel)
+        except Exception:
+            pass
+        # Fallback: treat as absolute, clamp, and store relative snapshot
+        if len(saved) == 4:
+            pane = self._clamp_pane(tuple(int(v) for v in saved))
+            self._relative_positions[name] = self._pane_to_relative(pane)
+            return pane
+        return getattr(self, f"{name}_pane")
+
+    def _pane_to_relative(self, pane: Tuple[int, int, int, int]) -> tuple[float, float, float, float]:
+        w = max(1, self.window.width)
+        h = max(1, self.window.height)
+        x, y, pw, ph = pane
+        return (x / w, y / h, pw / w, ph / h)
+
+    def _pane_from_relative(self, rel: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        w = max(1, self.window.width)
+        h = max(1, self.window.height)
+        rx, ry, rw, rh = rel
+        return self._clamp_pane((int(rx * w), int(ry * h), int(rw * w), int(rh * h)))
+
+    def _apply_relative_positions(self) -> None:
+        for name, rel in self._relative_positions.items():
+            if not isinstance(rel, (tuple, list)) or len(rel) != 4:
+                continue
+            abs_pane = self._pane_from_relative(tuple(float(v) for v in rel))
+            if name == "status":
+                self.status_pane = abs_pane
+            elif name == "actions":
+                self.actions_pane = abs_pane
+            elif name == "controls":
+                self.controls_pane = abs_pane
+
+    def _capture_relative_positions(self) -> None:
+        self._relative_positions["status"] = self._pane_to_relative(self.status_pane)
+        self._relative_positions["actions"] = self._pane_to_relative(self.actions_pane)
+        self._relative_positions["controls"] = self._pane_to_relative(self.controls_pane)
+
+    def set_available_windows(self, windows: List[WindowInfo], current_hwnd: Optional[int] = None) -> None:
+        self.available_windows = list(windows)
+        if current_hwnd:
+            self.selected_window_hwnd = current_hwnd
+        elif self.available_windows:
+            self.selected_window_hwnd = self.available_windows[0].hwnd
+        else:
+            self.selected_window_hwnd = None
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+
+    def start_options(self, windows: List[WindowInfo], current_hwnd: Optional[int]) -> None:
+        self._pane_sizes_backup = self._pane_sizes_snapshot()
+        self._selected_window_backup = current_hwnd
+        self.set_available_windows(windows, current_hwnd=current_hwnd)
+        self.options_modal_visible = True
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+
+    def apply_pane_sizes(self, pane_sizes: dict) -> None:
+        for name, size in pane_sizes.items():
+            if not isinstance(size, (tuple, list)) or len(size) != 2:
+                continue
+            w, h = size
+            if name == "status":
+                x, y, _, _ = self.status_pane
+                self.status_pane = self._clamp_pane((x, y, int(w), int(h)))
+            elif name == "actions":
+                x, y, _, _ = self.actions_pane
+                self.actions_pane = self._clamp_pane((x, y, int(w), int(h)))
+            elif name == "controls":
+                x, y, _, _ = self.controls_pane
+                self.controls_pane = self._clamp_pane((x, y, int(w), int(h)))
+        self._clamp_panes_to_window()
+        self._save_positions()
+        if self.on_panes_changed:
+            self.on_panes_changed(self._pane_sizes_snapshot())
+
+    def update_window(self, window: WindowInfo) -> None:
+        self.window = window
+        if self._hwnd:
+            left, top, right, bottom = window.rect
+            width, height = right - left, bottom - top
+            win32gui.SetWindowPos(self._hwnd, win32con.HWND_TOPMOST, left, top, width, height, win32con.SWP_SHOWWINDOW)
+        self._apply_relative_positions()
+        self._ensure_custom_rect()
+        self._ensure_options_rect()
+        self._clamp_panes_to_window()
+        if self._hwnd:
+            win32gui.InvalidateRect(self._hwnd, None, True)
+        if self.on_panes_changed:
+            self.on_panes_changed(self._pane_sizes_snapshot())

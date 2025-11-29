@@ -334,6 +334,10 @@ class SkillsWatcher:
         self._stop_event.set()
         self._thread.join(timeout=1.0)
 
+    def update_window(self, window: WindowInfo) -> None:
+        """Switch the target window while running."""
+        self.window = window
+
     def _update_status(self) -> None:
         if not self.overlay:
             return

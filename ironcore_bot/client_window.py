@@ -65,6 +65,29 @@ def find_window_for_process(process_name: str) -> Optional[WindowInfo]:
     return matches[0]
 
 
+def list_windows_for_process(process_name: str) -> list[WindowInfo]:
+    """
+    Return all visible windows for the given process name, sorted by area desc.
+    """
+    matches: list[WindowInfo] = []
+
+    def handler(hwnd: int, _: int) -> None:
+        info = _matches_process(hwnd, process_name)
+        if info:
+            matches.append(info)
+
+    win32gui.EnumWindows(handler, 0)
+    matches.sort(key=lambda w: w.width * w.height, reverse=True)
+    return matches
+
+
+def describe_window(window: WindowInfo) -> str:
+    """
+    Human-friendly label for a window entry.
+    """
+    return f"hwnd {window.hwnd} | pid {window.process_id} | {window.width}x{window.height}"
+
+
 def center_in_window(window: WindowInfo, region_width: int, region_height: int) -> tuple[int, int, int, int]:
     """
     Return a rectangle centered within the window: (left, top, width, height).
