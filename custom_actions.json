@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Busz",
+    "action1": "107",
+    "action2": "MouseLeft",
+    "count": "40"
+  },
+  {
+    "name": "Orc",
+    "action1": "221",
+    "action2": "221",
+    "count": "1200"
+  }
+]
