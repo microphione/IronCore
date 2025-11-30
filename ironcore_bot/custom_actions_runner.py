@@ -38,10 +38,12 @@ class CustomActionsRunner:
         poll_interval: float = 0.05,
         emit_interval: float = 0.05,
         on_update: Optional[Callable[[List[str]], None]] = None,
+        active_window: Optional[Callable[[], Optional[int]]] = None,
     ) -> None:
         self.poll_interval = poll_interval
         self.emit_interval = emit_interval
         self.on_update = on_update
+        self.active_window = active_window
         self.actions: List[ActionConfig] = []
         self.pending: List[PendingAction] = []
         self.active: List[dict] = []
@@ -102,6 +104,17 @@ class CustomActionsRunner:
             time.sleep(self.poll_interval)
 
     def tick(self) -> None:
+        if self.active_window:
+            try:
+                import win32gui
+
+                fg = win32gui.GetForegroundWindow()
+                target = self.active_window()
+                if target and fg != target:
+                    time.sleep(self.poll_interval)
+                    return
+            except Exception:
+                pass
         now = time.time()
         pressed = self._poll_inputs()
         # detekcja action1

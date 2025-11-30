@@ -21,10 +21,15 @@
     0.10588842975206611,
     0.2776717557251908,
     0.08987603305785125,
-    0.16221374045801526
+    0.1965648854961832
   ],
-  "selected_melee": "Distance",
+  "selected_melee": "Club",
   "selected_shield_mode": 1,
+  "hp_alert_threshold": 24,
+  "hp_alert_enabled": false,
+  "afk_alert_enabled": false,
+  "red_hp_alert_enabled": false,
+  "afk_alert_volume": 20,
   "show_exp": true,
   "show_timers": true,
   "show_skills": true

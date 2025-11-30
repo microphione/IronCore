@@ -19,6 +19,7 @@ import numpy as np
 import pytesseract
 from PIL import Image, ImageChops, ImageOps
 
+from .hp_reader import find_hp
 from .capture import capture_full_window
 from .client_window import WindowInfo
 from .skill_tables import get_distance_brackets, get_seconds_to_next
@@ -75,6 +76,8 @@ class SkillsInfo:
     experience: Optional[str]
     level: Optional[str]
     skills: Dict[str, str]
+    current_hp: Optional[int]
+    max_hp: Optional[int]
 
 
 def _binarize(img: Image.Image, threshold: int = 128) -> Image.Image:
@@ -405,6 +408,12 @@ def _extract_skills_from_data(
         y0 = min(b[1] for b in value_boxes)
         x1 = max(b[0] + b[2] for b in value_boxes)
         y1 = max(b[1] + b[3] for b in value_boxes)
+        # powiększ obszar dla club o 2px w każdą stronę, by poprawić OCR
+        if matched_alias == "club" or key == "club":
+            x0 = max(0, x0 - 2)
+            y0 = max(0, y0 - 2)
+            x1 = x1 + 2
+            y1 = y1 + 2
         bbox = (x0, y0, x1 - x0, y1 - y0)
         key = SKILL_ALIASES.get(matched_alias, matched_alias)
         if return_regions:
@@ -478,7 +487,7 @@ def analyze_skills(window: WindowInfo, save_debug: bool = False) -> SkillsInfo:
     else:
         anchor = _find_skills_anchor(full_img)
         if not anchor:
-            return SkillsInfo(region=None, experience=None, level=None, skills={})
+            return SkillsInfo(region=None, experience=None, level=None, skills={}, current_hp=None, max_hp=None)
         region = Region(anchor.x, anchor.y, PANEL_WIDTH, PANEL_HEIGHT)
 
     region = _normalize_region(region, window)
@@ -546,6 +555,8 @@ def analyze_skills(window: WindowInfo, save_debug: bool = False) -> SkillsInfo:
             if val and key not in skills:
                 skills[key] = val
 
+    hp_cur, hp_max, _, _, _ = find_hp(full_img, level_clean)
+
     if save_debug:
         try:
             debug_dir = Path("debug_skills")
@@ -558,7 +569,7 @@ def analyze_skills(window: WindowInfo, save_debug: bool = False) -> SkillsInfo:
         except Exception:
             pass
 
-    return SkillsInfo(region=region, experience=experience_clean, level=level_clean, skills=skills)
+    return SkillsInfo(region=region, experience=experience_clean, level=level_clean, skills=skills, current_hp=hp_cur, max_hp=hp_max)
 
 
 class SkillsWatcher:
@@ -572,6 +583,8 @@ class SkillsWatcher:
         self.last_experience: Optional[str] = None
         self.last_level: Optional[str] = None
         self.last_skills: Dict[str, str] = {}
+        self.last_hp_cur: Optional[int] = None
+        self.last_hp_max: Optional[int] = None
         self.tracker = tracker
         self.actions_runner = actions_runner
         self._stop_event = Event()
@@ -744,6 +757,12 @@ class SkillsWatcher:
             else:
                 skill_lines.append("ETA: ?")
 
+        # HP info
+        if self.last_hp_cur is not None or self.last_hp_max is not None:
+            hp_cur = self.last_hp_cur if self.last_hp_cur is not None else "?"
+            hp_max = self.last_hp_max if self.last_hp_max is not None else "?"
+            skill_lines.append(f"HP: {hp_cur} / {hp_max}")
+
         self.overlay.set_skills_status(skill_lines)
 
         if self.actions_runner:
@@ -786,6 +805,8 @@ class SkillsWatcher:
                     if _is_valid_level(info.level):
                         self.last_level = info.level
                     self.last_skills = info.skills or {}
+                    self.last_hp_cur = info.current_hp
+                    self.last_hp_max = info.max_hp
                     self._last_analyze = now
                     # reset ETA timestamps on fresh read
                     self._eta_last_ts = now
