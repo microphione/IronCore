@@ -24,11 +24,8 @@
     0.1965648854961832
   ],
   "selected_melee": "Club",
-  "selected_shield_mode": 1,
-  "hp_alert_threshold": 24,
-  "hp_alert_enabled": false,
+  "selected_shield_mode": 2,
   "afk_alert_enabled": false,
-  "red_hp_alert_enabled": false,
   "afk_alert_volume": 20,
   "show_exp": true,
   "show_timers": true,

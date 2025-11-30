@@ -41,3 +41,8 @@ Desktop.ini
 /debug_level.png
 /debug_skills/
 /debug_hp/
+
+# Local state/config
+/overlay_positions.json
+/.ironcore.lock
+/custom_actions.json
