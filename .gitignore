@@ -39,10 +39,15 @@ Desktop.ini
 /sample_capture.png
 /debug_experience.png
 /debug_level.png
+/tmp_exp_region.png
 /debug_skills/
 /debug_hp/
+<<<<<<< HEAD
 
 # Local state/config
 /overlay_positions.json
 /.ironcore.lock
 /custom_actions.json
+=======
+.ironcore.lock
+>>>>>>> origin/recover-20251216

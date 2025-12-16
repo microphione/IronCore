@@ -25,7 +25,6 @@ class SkillsWatcher:
         self.actions_runner = actions_runner
         self._stop_event = Event()
         self._thread = Thread(target=self._run, daemon=True)
-        self._debug_saved = False
         self._eta_seconds: Optional[float] = None
         self._eta_last_ts: float = time.monotonic()
         self._eta_snapshot: Optional[tuple[str, Optional[int], Optional[int]]] = None
@@ -196,9 +195,7 @@ class SkillsWatcher:
                         self._shield_last_ts = time.monotonic()
                 now = time.monotonic()
                 if now - self._last_analyze >= self.analyze_interval:
-                    info = analyze_skills(self.window, save_debug=not self._debug_saved)
-                    if not self._debug_saved and info.region:
-                        self._debug_saved = True
+                    info = analyze_skills(self.window, save_debug=False)
                     self.last_region = info.region
                     if is_valid_experience(info.experience):
                         self.last_experience = info.experience

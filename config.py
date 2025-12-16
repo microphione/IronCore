@@ -17,7 +17,7 @@ MANUAL_EXPERIENCE_OFFSET = None
 MANUAL_LEVEL_OFFSET = None
 
 # Czy zapisywać wycięte fragmenty Experience/Level (debug)?
-SAVE_DEBUG_CROPS = True
+SAVE_DEBUG_CROPS = False
 # Ścieżki do zapisów (relative do katalogu projektu)
 DEBUG_EXP_PATH = "debug_experience.png"
 DEBUG_LEVEL_PATH = "debug_level.png"
