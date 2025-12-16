@@ -120,16 +120,6 @@ def run_bot(process_name: str = PROCESS_NAME) -> None:
     watcher = SkillsWatcher(window=window, overlay=overlay, interval=1.0, tracker=tracker, actions_runner=actions_runner)
     watcher.start()
 
-    try:
-        image = capture_full_window(window.hwnd)
-        image.save("full_client_capture.png")
-        print(
-            f"Zapisano pelny zrzut okna klienta do full_client_capture.png "
-            f"(rozmiar {image.size[0]}x{image.size[1]})."
-        )
-    except Exception as exc:
-        print(f"Nie udalo sie wykonac zrzutu probnego: {exc}")
-
     def reset_stats() -> None:
         exp_text = watcher.last_experience
         try:

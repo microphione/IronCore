@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import difflib
 import re
+from pathlib import Path
 from typing import Dict, Optional
 
 from PIL import Image, ImageOps
@@ -23,6 +25,7 @@ SKILL_ALIASES = {
     "shield": "shielding",
     "defending": "shielding",
 }
+DEBUG_SKILL_CROPS = False
 
 
 def _normalize_skill_value(raw: str) -> str:
@@ -55,10 +58,24 @@ def parse_skill_value(raw: str) -> tuple[Optional[int], Optional[int]]:
 
 def parse_skill_lines(text: str) -> Dict[str, str]:
     results: Dict[str, str] = {}
+
+    def _alias_in_line(alias: str, lower_line: str) -> bool:
+        if alias in lower_line:
+            return True
+        # club bywa zjadane lub mylone (ciub/ctub), dołóż delikatny fuzzy match
+        if "club" in alias:
+            from difflib import SequenceMatcher
+
+            words = re.split(r"\s+", lower_line)
+            for w in words:
+                if SequenceMatcher(None, w, "club").ratio() >= 0.6:
+                    return True
+        return False
+
     for line in text.splitlines():
         lower = line.lower()
         for alias, key in SKILL_ALIASES.items():
-            if alias in lower:
+            if _alias_in_line(alias, lower):
                 match = re.search(r"(\d+\s*(?:\(\s*[^)]+\s*\))?)", line)
                 if match:
                     results[key] = _normalize_skill_value(match.group(1).strip())
@@ -92,6 +109,20 @@ def extract_skills_from_data(
 
     results: Dict[str, str] = {}
     aliases_sorted = sorted(SKILL_ALIASES.keys(), key=lambda a: (-len(a.split()), -len(a)))
+    debug_dir = Path("debug_skills")
+
+    def _save_debug_crop(key: str, bbox: tuple[int, int, int, int]) -> None:
+        if not DEBUG_SKILL_CROPS or key not in ("club", "shielding"):
+            return
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            return
+        try:
+            debug_dir.mkdir(exist_ok=True)
+            region = crop_ocr.crop((x, y, x + w, y + h))
+            region.save(debug_dir / f"{key}_region.png")
+        except Exception:
+            pass
 
     for entry in lines.values():
         words = entry["words"]
@@ -100,10 +131,18 @@ def extract_skills_from_data(
         matched_alias = None
         start_idx = None
         alias_len = 0
+
+        def _token_matches(word: str, token: str) -> bool:
+            if word.startswith(token):
+                return True
+            if token == "club":
+                return difflib.SequenceMatcher(None, word, token).ratio() >= 0.6
+            return False
+
         for alias in aliases_sorted:
             tokens = alias.split()
             for i in range(len(lower_words) - len(tokens) + 1):
-                if all(lower_words[i + j].startswith(tokens[j]) for j in range(len(tokens))):
+                if all(_token_matches(lower_words[i + j], tokens[j]) for j in range(len(tokens))):
                     matched_alias = alias
                     start_idx = i
                     alias_len = len(tokens)
@@ -120,8 +159,10 @@ def extract_skills_from_data(
             x1 = max(b[0] + b[2] for b in value_boxes)
             y1 = max(b[1] + b[3] for b in value_boxes)
             bbox = (x0, y0, x1 - x0, y1 - y0)
-            if key == "shielding":
-                bbox = _expand_bbox(bbox, pad=2, max_w=crop.width, max_h=crop.height)
+            if key in ("shielding", "club"):
+                pad = 2 if key == "shielding" else 1
+                bbox = _expand_bbox(bbox, pad=pad, max_w=crop.width, max_h=crop.height)
+                _save_debug_crop(key, bbox)
             val = _ocr_box_value(crop, bbox) or _ocr_box_value(crop_ocr, bbox)
             if val:
                 results[key] = _normalize_skill_value(val)
@@ -136,8 +177,10 @@ def extract_skills_from_data(
         y_bottom = max(b[1] + b[3] for b in alias_boxes)
         box_h = max(1, y_bottom - y_top)
         bbox = (right_start + 2, y_top - 2, 80, box_h + 4)
-        if key == "shielding":
-            bbox = _expand_bbox(bbox, pad=2, max_w=crop.width, max_h=crop.height)
+        if key in ("shielding", "club"):
+            pad = 2 if key == "shielding" else 1
+            bbox = _expand_bbox(bbox, pad=pad, max_w=crop.width, max_h=crop.height)
+            _save_debug_crop(key, bbox)
         val = _ocr_box_value(crop, bbox) or _ocr_box_value(crop_ocr, bbox)
         if val:
             results[key] = _normalize_skill_value(val)

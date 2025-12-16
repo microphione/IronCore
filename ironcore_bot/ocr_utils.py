@@ -10,6 +10,13 @@ from PIL import Image, ImageChops, ImageOps
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "assets" / "templates" / "skills"
 _TEMPLATE_CACHE: Dict[str, Image.Image] = {}
 _DIGIT_TEMPLATES_NP: Optional[dict[str, np.ndarray]] = None
+_TEMPLATE_CHAR_MAP = {
+    "comma": ",",
+    "percent": "%",
+    "lparen": "(",
+    "rparen": ")",
+    "slash": "/",
+}
 
 
 def binarize(img: Image.Image, threshold: int = 128) -> Image.Image:
@@ -52,7 +59,9 @@ def segment_glyphs(line_img: Image.Image) -> list[Image.Image]:
     for left, right in segments:
         box = (left, 0, right, height)
         glyph = line.crop(box)
-        bbox = glyph.getbbox()
+        # getbbox() zwraca obszar niezerowych pikseli, a tło jest białe (255),
+        # więc odwracamy kolory, aby liczył się tylko tusz glifu.
+        bbox = ImageOps.invert(glyph).getbbox()
         if bbox:
             glyphs.append(glyph.crop(bbox))
     return glyphs
@@ -86,19 +95,44 @@ def read_with_templates(value_img: Image.Image) -> Optional[str]:
     if not glyphs:
         return None
     chars: list[str] = []
+
+    def _score_glyph_to_template(glyph: Image.Image, tmpl: Image.Image) -> int:
+        """
+        Porównaj glif z szablonem bez skalowania.
+        Jeżeli rozmiary się różnią, obrazy są centrowane na wspólnej planszy
+        i porównywane w oryginalnej rozdzielczości.
+        """
+        gw, gh = glyph.size
+        tw, th = tmpl.size
+        if (gw, gh) == (tw, th):
+            diff = ImageChops.difference(glyph, tmpl)
+            return sum(diff.getdata())
+
+        canvas_w = max(gw, tw)
+        canvas_h = max(gh, th)
+
+        def _center_on_canvas(img: Image.Image) -> Image.Image:
+            canvas = Image.new("L", (canvas_w, canvas_h), color=255)
+            offset = ((canvas_w - img.size[0]) // 2, (canvas_h - img.size[1]) // 2)
+            canvas.paste(img, offset)
+            return canvas
+
+        g_pad = _center_on_canvas(glyph)
+        t_pad = _center_on_canvas(tmpl)
+        diff = ImageChops.difference(g_pad, t_pad)
+        return sum(diff.getdata())
+
     for glyph in glyphs:
         best_char = None
         best_score = None
         for char, tmpl in templates.items():
-            resized = glyph.resize(tmpl.size, Image.LANCZOS)
-            diff = ImageChops.difference(resized, tmpl)
-            score = sum(diff.getdata())
+            score = _score_glyph_to_template(glyph, tmpl)
             if best_score is None or score < best_score:
                 best_score = score
                 best_char = char
         if best_char is None:
             return None
-        chars.append(best_char)
+        chars.append(_TEMPLATE_CHAR_MAP.get(best_char, best_char))
     return "".join(chars)
 
 

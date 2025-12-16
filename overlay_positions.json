@@ -1,7 +1,7 @@
 {
   "status": [
     0.004132231404958678,
-    0.5286259541984732,
+    0.6793893129770993,
     0.10227272727272728,
     0.12022900763358779
   ],
@@ -13,7 +13,7 @@
   ],
   "controls": [
     0.004132231404958678,
-    0.6889312977099237,
+    0.816793893129771,
     0.10227272727272728,
     0.12213740458015267
   ],
@@ -25,12 +25,9 @@
   ],
   "selected_melee": "Club",
   "selected_shield_mode": 1,
-  "hp_alert_threshold": 24,
-  "hp_alert_enabled": true,
   "afk_alert_enabled": false,
-  "red_hp_alert_enabled": false,
   "afk_alert_volume": 20,
   "show_exp": true,
-  "show_timers": true,
+  "show_timers": false,
   "show_skills": true
 }
